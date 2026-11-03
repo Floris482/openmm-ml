@@ -132,7 +132,12 @@ def addLinkAtomSites(topology: openmm.app.Topology, systems: list[openmm.System]
         siteChain = topology.addChain()
     for site in range(len(linkBonds)):
         siteIndices.append(topology.addAtom(f"V{site}", openmm.app.element.hydrogen, topology.addResidue(f"V{site}", siteChain)).index)
-    atomicNumbers = [atom.element.atomic_number for atom in topology.atoms()]
+    atomicNumbers = {
+            atom.index: atom.element.atomic_number
+            for atom in topology.atoms()
+            if atom.element is not None
+        }
+
 
     # Add virtual sites to the systems.
 
