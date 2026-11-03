@@ -75,6 +75,8 @@ class TorchMDNetPotentialImpl(MLPotentialImpl):
 
     Pretained AceFF models can be used directly:
 
+    >>> potential = MLPotential('aceff-2-omol')
+
     >>> potential = MLPotential('aceff-2.0')
 
     >>> potential = MLPotential('aceff-1.1')
@@ -99,6 +101,7 @@ class TorchMDNetPotentialImpl(MLPotentialImpl):
         'aceff-1.0': ('Acellera/AceFF-1.0', 'aceff_v1.0.ckpt', False),
         'aceff-1.1': ('Acellera/AceFF-1.1', 'aceff_v1.1.ckpt', False),
         'aceff-2.0': ('Acellera/AceFF-2.0', 'aceff_v2.0.ckpt', False),
+        'aceff-2-omol': ('Acellera/AceFF-2-OMOL', 'aceff_v2_omol.ckpt', False),
     }
 
     def __init__(self, 
@@ -114,7 +117,7 @@ class TorchMDNetPotentialImpl(MLPotentialImpl):
         ----------
         name : str
             The name of the model.
-            'torchmdnet' for a local model file, or pretrained models are available: 'aceff-1.0' or 'aceff-1.1'. 
+            'torchmdnet' for a local model file, or pretrained models are available: 'aceff-1.0', 'aceff-1.1', 'aceff-2.0' or 'aceff-2-omol'. 
         modelPath : str, optional
             The path to the locally trained torchmdnet model if ``name`` is 'torchmdnet'.
         lengthScale : float
@@ -182,7 +185,6 @@ class TorchMDNetPotentialImpl(MLPotentialImpl):
             max_num_neighbors = min(args.get('max_num_neighbors', 64), numbers.shape[0]),
             coulomb_cutoff = cutoff if use_coulomb_cutoff else None,
             static_shapes = True,
-            check_errors = False
         ).to(device)
         for parameter in model.parameters():
             parameter.requires_grad = False
@@ -191,10 +193,6 @@ class TorchMDNetPotentialImpl(MLPotentialImpl):
             batch = torch.zeros_like(numbers, requires_grad=False)
         else:
             batch = torch.tensor(batch, dtype=torch.long, device=device, requires_grad=False)
-        if atoms is None:
-            indices = None
-        else:
-            indices = np.array(atoms)
 
         # Create the PythonForce and add it to the System.
 
@@ -204,11 +202,12 @@ class TorchMDNetPotentialImpl(MLPotentialImpl):
                                      batch=batch,
                                      lengthScale=self.lengthScale,
                                      energyScale=self.energyScale,
-                                     indices=indices,
                                      periodic=periodic)
         force = openmm.PythonForce(compute)
         force.setForceGroup(forceGroup)
         force.setUsesPeriodicBoundaryConditions(periodic)
+        if atoms is not None:
+            force.setParticles(atoms)
         system.addForce(force)
 
     def getMLLongRange(self) -> bool | None:
@@ -218,7 +217,7 @@ class TorchMDNetPotentialImpl(MLPotentialImpl):
         return None
 
 class _ComputeTorchMDNet(object):
-    def __init__(self, model, numbers, charge, batch, lengthScale, energyScale, indices, periodic):
+    def __init__(self, model, numbers, charge, batch, lengthScale, energyScale, periodic):
         self.model = model
         self.compiled_model = None
         self.numbers = numbers
@@ -226,17 +225,13 @@ class _ComputeTorchMDNet(object):
         self.batch = batch
         self.lengthScale = lengthScale
         self.energyScale = energyScale
-        self.indices = indices
         self.periodic = periodic
         self.has_recompiled = False
 
     def __call__(self, state):
         import torch
         positions = state.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
-        numAtoms = positions.shape[0]
         positions = torch.tensor(positions, dtype=torch.float32, device=self.numbers.device)
-        if self.indices is not None:
-            positions = positions[self.indices]
         positions.requires_grad_(True)
         if self.periodic:
             cell = torch.tensor(state.getPeriodicBoxVectors(asNumpy=True).value_in_unit(unit.nanometer), dtype=torch.float32, device=self.numbers.device)/self.lengthScale
@@ -261,8 +256,4 @@ class _ComputeTorchMDNet(object):
                 energy = self.compiled_model(z=self.numbers, pos=positions/self.lengthScale, batch=self.batch, q=self.charge, box=cell)[0]*self.energyScale
         energy.backward()
         forces = (-positions.grad).detach().cpu().numpy()
-        if self.indices is not None:
-            f = np.zeros((numAtoms, 3), dtype=np.float32)
-            f[self.indices] = forces
-            forces = f
         return energy, forces
