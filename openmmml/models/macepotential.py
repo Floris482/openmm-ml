@@ -36,6 +36,7 @@ from functools import partial
 import numpy as np
 
 
+
 class MACEPotentialImplFactory(MLPotentialImplFactory):
     """This is the factory that creates MACEPotentialImpl objects."""
 
@@ -123,6 +124,63 @@ class MACEPotentialImpl(MLPotentialImpl):
         """
         self.name = name
         self.modelPath = modelPath
+        self._model_cache = {}
+
+    def _get_cached_model(self, device, dtype=None):
+        import torch
+
+
+        key = (str(device), dtype)
+
+        if key not in self._model_cache:
+
+            print(f"Loading MACE model for {key}")
+
+            from mace.calculators.foundations_models import (
+                mace_off,
+                mace_mp,
+                mace_omol,
+                mace_polar,
+            )
+
+            functions = {
+                "mace_off": mace_off,
+                "mace_mp": mace_mp,
+                "mace_omol": mace_omol,
+                "mace_polar": mace_polar,
+            }
+
+            if self.name in self.KNOWN_MODELS:
+
+                fnName, name, _, _ = self.KNOWN_MODELS[self.name]
+
+                model = functions[fnName](
+                    model=name,
+                    device=device,
+                    return_raw_model=True,
+                ).to(device)
+
+            elif self.name == "mace":
+
+                if self.modelPath is None:
+                    raise ValueError("No modelPath provided.")
+
+                model = torch.load(
+                    self.modelPath,
+                    map_location=device,
+                    weights_only=False,
+                ).to(device)
+
+            else:
+                raise ValueError(f"Unsupported MACE model: {self.name}")
+
+            model = model.to(dtype)
+
+            model.eval()
+
+            self._model_cache[key] = model
+
+        return self._model_cache[key]
 
     def addForces(
         self,
@@ -170,25 +228,9 @@ class MACEPotentialImpl(MLPotentialImpl):
         # Load the model.
 
         device = self._getTorchDevice(args)
-        if self.name in MACEPotentialImpl.KNOWN_MODELS:
-            functions = {
-                'mace_off': mace_off,
-                'mace_mp': mace_mp,
-                'mace_omol': mace_omol,
-                'mace_polar': mace_polar,
-            }
-            fnName, name, restrictiveLicense, _ = MACEPotentialImpl.KNOWN_MODELS[self.name]
-            model = functions[fnName](model=name, device=device, return_raw_model=True).to(device)
-            if restrictiveLicense is not None:
-                import logging
-                logging.warning(f'The model {self.name} is distributed under the restrictive {restrictiveLicense} license.  Commercial use is not permitted.')
-        elif self.name == "mace":
-            if self.modelPath is not None:
-                model = torch.load(self.modelPath, map_location=device).to(device)
-            else:
-                raise ValueError("No modelPath provided for local MACE model.")
-        else:
-            raise ValueError(f"Unsupported MACE model: {self.name}")
+
+        # Reuse the cached model instead of loading a new one.
+        model = self._get_cached_model(device)
 
         # Get the atomic numbers of the ML region.
 
@@ -223,21 +265,44 @@ class MACEPotentialImpl(MLPotentialImpl):
 
         # Create the PythonForce and add it to the System.
 
-        compute = partial(_computeMACE,
-                          model=model,
-                          ptr=torch.tensor([0, nodeAttrs.shape[0]], dtype=torch.long, device=device, requires_grad=False),
-                          node_attrs=nodeAttrs.to(dtype),
-                          batch=torch.zeros(nodeAttrs.shape[0], dtype=torch.long, device=device, requires_grad=False),
-                          pbc=torch.tensor([periodic, periodic, periodic], dtype=torch.bool, device=device, requires_grad=False),
-                          returnEnergyType=returnEnergyType,
-                          charge=torch.tensor([float(args.get('charge', 0))], dtype=dtype, device=device, requires_grad=False),
-                          multiplicity=torch.tensor([float(args.get('multiplicity', 1))], dtype=dtype, device=device, requires_grad=False),
-                          periodic=periodic)
+        compute = partial(
+        _computeMACE,
+        model=model,
+        atoms=list(atoms) if atoms is not None else None,
+        ptr=torch.tensor(
+            [0, nodeAttrs.shape[0]],
+            dtype=torch.long,
+            device=device
+        ),
+        node_attrs=nodeAttrs.to(dtype),
+        batch=torch.zeros(
+            nodeAttrs.shape[0],
+            dtype=torch.long,
+            device=device
+        ),
+        pbc=torch.tensor(
+            [periodic, periodic, periodic],
+            dtype=torch.bool,
+            device=device
+        ),
+        returnEnergyType=returnEnergyType,
+        charge=torch.tensor(
+            [float(args.get('charge', 0))],
+            dtype=dtype,
+            device=device
+        ),
+        multiplicity=torch.tensor(
+            [float(args.get('multiplicity', 1))],
+            dtype=dtype,
+            device=device
+        ),
+        periodic=periodic
+    )
+
         force = openmm.PythonForce(compute)
         force.setForceGroup(forceGroup)
         force.setUsesPeriodicBoundaryConditions(periodic)
-        if atoms is not None:
-            force.setParticles(atoms)
+
         system.addForce(force)
 
     def getMLLongRange(self) -> bool | None:
@@ -247,37 +312,112 @@ class MACEPotentialImpl(MLPotentialImpl):
         return None
 
 
-def _computeMACE(state, model, ptr, node_attrs, batch, pbc, returnEnergyType, charge, multiplicity, periodic):
+def _computeMACE(
+    state,
+    model,
+    atoms,
+    ptr,
+    node_attrs,
+    batch,
+    pbc,
+    returnEnergyType,
+    charge,
+    multiplicity,
+    periodic
+):
     import torch
     from mace.data.neighborhood import get_neighborhood
+
     energyScale = 96.4853
     lengthScale = 10.0
-    positions = state.getPositions(asNumpy=True).value_in_unit(unit.angstrom)
+
+    # Get positions of all particles in the OpenMM system.
+    allPositions = state.getPositions(
+        asNumpy=True
+    ).value_in_unit(unit.angstrom)
+
+    # Select only the MACE atoms, including link atoms.
+    if atoms is not None:
+        positions = allPositions[atoms]
+    else:
+        positions = allPositions
+
     if periodic:
-        cell = state.getPeriodicBoxVectors(asNumpy=True).value_in_unit(unit.angstrom)
+        cell = state.getPeriodicBoxVectors(
+            asNumpy=True
+        ).value_in_unit(unit.angstrom)
     else:
         cell = np.identity(3, dtype=np.float64)
+
     dtype = node_attrs.dtype
     cutoff = float(model.r_max.detach())
-    edgeIndex, shifts, _, _ = get_neighborhood(positions, cutoff, [periodic, periodic, periodic], cell)
-    cellTensor = torch.tensor(cell, dtype=dtype, device=ptr.device)
+
+    edgeIndex, shifts, _, _ = get_neighborhood(
+        positions,
+        cutoff,
+        [periodic, periodic, periodic],
+        cell
+    )
+
+    cellTensor = torch.tensor(
+        cell,
+        dtype=dtype,
+        device=ptr.device
+    )
+
     inputDict = {
         "ptr": ptr,
         "node_attrs": node_attrs,
         "batch": batch,
         "pbc": pbc,
-        "positions": torch.tensor(positions, dtype=dtype, device=ptr.device),
-        "edge_index": torch.tensor(edgeIndex, dtype=torch.int64, device=ptr.device),
-        "shifts": torch.tensor(shifts, dtype=dtype, device=ptr.device),
+        "positions": torch.tensor(
+            positions,
+            dtype=dtype,
+            device=ptr.device
+        ),
+        "edge_index": torch.tensor(
+            edgeIndex,
+            dtype=torch.int64,
+            device=ptr.device
+        ),
+        "shifts": torch.tensor(
+            shifts,
+            dtype=dtype,
+            device=ptr.device
+        ),
         "cell": cellTensor,
         "rcell": 2 * torch.pi * torch.linalg.inv(cellTensor.mT),
         "volume": torch.linalg.det(cellTensor).reshape(1),
         "total_charge": charge,
         "total_spin": multiplicity,
-        "external_field": torch.zeros((1, 3), dtype=dtype, device=ptr.device),
-        "fermi_level": torch.zeros((1,), dtype=dtype, device=ptr.device)
+        "external_field": torch.zeros(
+            (1, 3), dtype=dtype, device=ptr.device
+        ),
+        "fermi_level": torch.zeros(
+            (1,), dtype=dtype, device=ptr.device
+        )
     }
+
     results = model(inputDict, compute_force=True)
-    energy = float(results[returnEnergyType].detach())*energyScale
-    forces = (results["forces"]*energyScale*lengthScale).detach().cpu().numpy()
+
+    energy = float(
+        results[returnEnergyType].detach()
+    ) * energyScale
+
+    # MACE forces, in OpenMM units.
+    maceForces = (
+        results["forces"] * energyScale * lengthScale
+    ).detach().cpu().numpy()
+
+    # Allocate forces for the entire OpenMM system.
+    forces = np.zeros(
+        (len(allPositions), 3),
+        dtype=np.float64
+    )
+
+    if atoms is None:
+        forces[:] = maceForces
+    else:
+        forces[atoms] = maceForces
+
     return energy, forces
