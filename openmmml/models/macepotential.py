@@ -233,12 +233,12 @@ class MACEPotentialImpl(MLPotentialImpl):
                           charge=torch.tensor([float(args.get('charge', 0))], dtype=dtype, device=device, requires_grad=False),
                           multiplicity=torch.tensor([float(args.get('multiplicity', 1))], dtype=dtype, device=device, requires_grad=False),
                           periodic=periodic)
-        force = openmm.PythonForce(compute)
-        force.setForceGroup(forceGroup)
-        force.setUsesPeriodicBoundaryConditions(periodic)
-        if atoms is not None:
-            force.setParticles(atoms)
-        system.addForce(force)
+        #force = openmm.PythonForce(compute)
+        #force.setForceGroup(forceGroup)
+        #force.setUsesPeriodicBoundaryConditions(periodic)
+        #if atoms is not None:
+        #    force.setParticles(atoms)
+        #system.addForce(force)
 
     def getMLLongRange(self) -> bool | None:
         if self.name in MACEPotentialImpl.KNOWN_MODELS:
